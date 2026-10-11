@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+runs/*
+!runs/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+role_analysis/
+*.egg-info/

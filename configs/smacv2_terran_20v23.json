@@ -1,0 +1,9 @@
+{
+  "experiment_name": "grdc_smacv2_terran_20v23",
+  "seed": 1,
+  "device": "auto",
+  "environment": {"name": "smacv2", "n_agents": 20, "n_enemies": 23, "race": "terran", "episode_limit": 400},
+  "model": {"hidden_dim": 128, "attention_dim": 64, "n_prototypes": 10, "min_prototypes": 2},
+  "training": {"total_steps": 10000000, "rollout_steps": 1024, "update_epochs": 10, "minibatch_chunks": 8, "recurrent_chunk_length": 16, "actor_lr": 0.0005, "critic_lr": 0.0005, "role_entropy_coef": 0.01, "prototype_decorrelation_coef": 0.01, "pruning_sensitivity": 0.01, "pruning_warmup_steps": 500000, "pruning_interval_steps": 250000, "eval_interval_steps": 100000, "eval_episodes": 32, "save_interval_steps": 250000}
+}
+

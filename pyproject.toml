@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grdc-reproduction"
+version = "0.1.0"
+description = "A reproducible MAPPO implementation of Graph-driven Role Discovery and Communication (GRDC)."
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24,<2",
+  "torch>=2.2,<2.9",
+  "tensorboard>=2.14,<2.21",
+]
+
+[project.optional-dependencies]
+analysis = ["matplotlib>=3.8,<3.10"]
+dev = ["pytest>=8,<9"]
+
+[tool.setuptools.packages.find]
+include = ["grdc*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+

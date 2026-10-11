@@ -1,0 +1,4 @@
+numpy>=1.24,<2
+torch>=2.2,<2.9
+tensorboard>=2.14,<2.21
+
