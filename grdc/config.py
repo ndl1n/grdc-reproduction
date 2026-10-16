@@ -36,6 +36,10 @@ class ModelConfig:
     use_roles: bool = True
     use_local_graph: bool = True
     use_intra_role_communication: bool = True
+    # False preserves architecture/equations of pre-audit checkpoints.
+    paper_equations: bool = False
+    include_previous_action: bool = False
+    stable_role_attention: bool = True
 
 
 @dataclass
@@ -65,6 +69,8 @@ class TrainingConfig:
     eval_episodes: int = 32
     save_interval_steps: int = 250_000
     normalize_advantages: bool = True
+    critic_objective: str = "ppo_clipped"
+    keep_step_checkpoints: bool = True
 
 
 @dataclass
@@ -89,6 +95,16 @@ class ExperimentConfig:
             raise ValueError("n_agents must be at least 2")
         if self.model.n_prototypes < self.model.min_prototypes:
             raise ValueError("n_prototypes must be >= min_prototypes")
+        if self.model.min_prototypes < 1:
+            raise ValueError("min_prototypes must be positive")
+        if self.model.paper_equations and not self.model.stable_role_attention:
+            raise ValueError("paper_equations mode requires stable_role_attention")
+        if self.training.critic_objective not in {"ppo_clipped", "td"}:
+            raise ValueError("critic_objective must be ppo_clipped or td")
+        if self.training.eval_interval_steps < 1 or self.training.save_interval_steps < 1:
+            raise ValueError("Evaluation/checkpoint intervals must be positive")
+        if self.training.eval_episodes < 1 or self.training.total_steps < 1:
+            raise ValueError("Evaluation episodes and total_steps must be positive")
         if not 0.0 < self.training.pruning_sensitivity < 1.0:
             raise ValueError("pruning_sensitivity must be in (0, 1)")
         if self.training.rollout_steps < self.training.recurrent_chunk_length:
@@ -112,10 +128,14 @@ def _construct(data: dict[str, Any]) -> ExperimentConfig:
     unknown = set(data) - known - {"environment", "model", "training"}
     if unknown:
         raise ValueError(f"Unknown top-level config keys: {sorted(unknown)}")
+    model_data = dict(data.get("model", {}))
+    # Serialized configs/checkpoints predating the fix must retain original
+    # floating-point forward behavior for retrospective evaluation.
+    model_data.setdefault("stable_role_attention", bool(model_data.get("paper_equations", False)))
     cfg = ExperimentConfig(
         **{k: data[k] for k in known if k in data},
         environment=EnvironmentConfig(**data.get("environment", {})),
-        model=ModelConfig(**data.get("model", {})),
+        model=ModelConfig(**model_data),
         training=TrainingConfig(**data.get("training", {})),
     )
     cfg.validate()

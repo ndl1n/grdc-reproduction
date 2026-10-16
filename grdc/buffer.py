@@ -25,6 +25,7 @@ class RolloutBuffer:
         self.available_actions = np.zeros((t, n, shapes.n_actions), dtype=np.bool_)
         self.hidden = np.zeros((t, n, shapes.hidden_dim), dtype=np.float32)
         self.actions = np.zeros((t, n), dtype=np.int64)
+        self.previous_actions = np.full((t, n), -1, dtype=np.int64)
         self.log_probabilities = np.zeros((t, n), dtype=np.float32)
         self.role_assignments = np.zeros((t, n), dtype=np.int64)
         self.role_probabilities: np.ndarray | None = None
@@ -60,6 +61,7 @@ class RolloutBuffer:
         reward: float,
         episode_start: bool,
         episode_end: bool,
+        previous_actions: np.ndarray | None = None,
     ) -> None:
         if self.position >= self.shapes.capacity:
             raise RuntimeError("Rollout buffer is full")
@@ -70,6 +72,7 @@ class RolloutBuffer:
         self.available_actions[i] = available_actions
         self.hidden[i] = hidden
         self.actions[i] = actions
+        self.previous_actions[i] = -1 if previous_actions is None else previous_actions
         self.log_probabilities[i] = log_probabilities
         self.role_assignments[i] = role_assignments
         assert self.role_probabilities is not None

@@ -4,14 +4,38 @@ from pathlib import Path
 
 import numpy as np
 
-from grdc.config import load_config
+from grdc.config import load_config, config_from_dict
 from grdc.envs import make_env
 
 
 def test_all_configs_load() -> None:
-    for path in Path("configs").glob("*.json"):
+    for path in Path("configs").rglob("*.json"):
         config = load_config(path)
         assert config.training.total_steps > 0
+
+
+def test_serialized_legacy_config_keeps_original_attention_behavior():
+    legacy = config_from_dict({"model": {"hidden_dim": 128}})
+    assert not legacy.model.stable_role_attention
+    assert not legacy.model.include_previous_action
+    revised = config_from_dict({"model": {"paper_equations": True}})
+    assert revised.model.stable_role_attention
+
+
+def test_revised_baseline_has_same_environment_history_and_learning_settings():
+    grdc = load_config("configs/revised/cooperative_navigation.json")
+    mappo = load_config("configs/revised/mappo_cooperative_navigation.json")
+    assert grdc.environment == mappo.environment
+    assert grdc.model.paper_equations and mappo.model.paper_equations
+    assert grdc.model.include_previous_action and mappo.model.include_previous_action
+    left, right = grdc.to_dict()["training"], mappo.to_dict()["training"]
+    for name in ["role_entropy_coef", "prototype_decorrelation_coef", "enable_pruning"]:
+        left.pop(name)
+        right.pop(name)
+    assert left == right
+    assert not mappo.model.use_roles
+    assert not mappo.model.use_local_graph
+    assert not mappo.model.use_intra_role_communication
 
 
 def test_cooperative_navigation_shapes_and_determinism() -> None:

@@ -1,0 +1,42 @@
+{
+  "experiment_name": "grdc_smacv2_protoss_10v10_v2",
+  "seed": 1,
+  "device": "auto",
+  "environment": {
+    "name": "smacv2",
+    "n_agents": 10,
+    "n_enemies": 10,
+    "race": "protoss",
+    "episode_limit": 400
+  },
+  "model": {
+    "hidden_dim": 128,
+    "attention_dim": 64,
+    "n_prototypes": 10,
+    "min_prototypes": 1,
+    "paper_equations": true,
+    "stable_role_attention": true,
+    "include_previous_action": true
+  },
+  "training": {
+    "total_steps": 10000000,
+    "rollout_steps": 1024,
+    "update_epochs": 10,
+    "minibatch_chunks": 8,
+    "recurrent_chunk_length": 16,
+    "actor_lr": 0.0005,
+    "critic_lr": 0.0005,
+    "role_entropy_coef": 0.01,
+    "prototype_decorrelation_coef": 0.01,
+    "pruning_sensitivity": 0.01,
+    "pruning_warmup_steps": 500000,
+    "pruning_interval_steps": 250000,
+    "eval_interval_steps": 100000,
+    "eval_episodes": 32,
+    "save_interval_steps": 250000,
+    "critic_objective": "td",
+    "keep_step_checkpoints": false
+  },
+  "output_dir": "runs/revised",
+  "checkpoint_dir": "checkpoints/revised"
+}

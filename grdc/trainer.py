@@ -14,7 +14,7 @@ from torch import nn
 from torch.distributions import Categorical
 
 from grdc.buffer import BufferShapes, RolloutBuffer
-from grdc.config import ExperimentConfig
+from grdc.config import ExperimentConfig, config_from_dict, load_config
 from grdc.envs import MultiAgentEnv, make_env
 from grdc.models import CentralizedCritic, GRDCActor
 
@@ -36,6 +36,33 @@ def select_device(requested: str) -> torch.device:
     return device
 
 
+def critic_loss(values: torch.Tensor, old_values: torch.Tensor,
+                returns: torch.Tensor, td_targets: torch.Tensor, config) -> torch.Tensor:
+    if config.critic_objective == "td":
+        # Eq. (9): next_values were collected with the frozen pre-update critic.
+        return (values - td_targets).square().mean()
+    clipped = old_values + (values - old_values).clamp(-config.value_clip, config.value_clip)
+    return 0.5 * torch.maximum((values - returns).square(), (clipped - returns).square()).mean()
+
+
+def validate_checkpoint_config(current: ExperimentConfig, saved: ExperimentConfig,
+                               load_optimizers: bool = True) -> None:
+    """Check before loading weights or creating/modifying any run files."""
+    if saved.model != current.model or saved.environment != current.environment:
+        raise ValueError("Checkpoint model/environment settings differ; use its original config or start a fresh run")
+    if not load_optimizers:
+        return
+    if saved.seed != current.seed:
+        raise ValueError("Resume seed must match the checkpoint")
+    mutable = {"eval_interval_steps", "eval_episodes", "save_interval_steps", "keep_step_checkpoints"}
+    saved_training = saved.to_dict()["training"]
+    current_training = current.to_dict()["training"]
+    different = [key for key in saved_training
+                 if key not in mutable and saved_training[key] != current_training[key]]
+    if different:
+        raise ValueError(f"Resume changes learning settings: {different}; start a fresh experiment instead")
+
+
 @dataclass
 class TrainMetrics:
     policy_loss: float = 0.0
@@ -45,6 +72,10 @@ class TrainMetrics:
     decorrelation_loss: float = 0.0
     approx_kl: float = 0.0
     clip_fraction: float = 0.0
+    actor_grad_norm: float = 0.0
+    actor_grad_norm_max: float = 0.0
+    actor_grad_clip_scale: float = 0.0
+    policy_head_grad_norm: float = 0.0
 
 
 class CsvLogger:
@@ -53,6 +84,10 @@ class CsvLogger:
         self.path = path
         self.fieldnames = fieldnames
         self._header_written = path.exists() and path.stat().st_size > 0
+        if self._header_written:
+            # Older CSVs lack new diagnostic columns; never append a mismatched schema.
+            with path.open(newline="", encoding="utf-8-sig") as stream:
+                self.fieldnames = next(csv.reader(stream))
 
     def write(self, row: dict[str, Any]) -> None:
         with self.path.open("a", newline="", encoding="utf-8") as handle:
@@ -64,8 +99,15 @@ class CsvLogger:
 
 
 class GRDCTrainer:
-    def __init__(self, config: ExperimentConfig) -> None:
+    def __init__(self, config: ExperimentConfig, *, record_run: bool = True) -> None:
         self.config = config
+        self.record_run = record_run
+        run_name = f"{config.experiment_name}_seed{config.seed}"
+        self.run_dir = Path(config.output_dir) / run_name
+        self.checkpoint_dir = Path(config.checkpoint_dir) / run_name
+        config_path = self.run_dir / "resolved_config.json"
+        if record_run and config_path.exists():
+            validate_checkpoint_config(config, load_config(config_path))
         seed_everything(config.seed)
         self.device = select_device(config.device)
         self.env = make_env(config.environment, seed=config.seed)
@@ -87,13 +129,12 @@ class GRDCTrainer:
                 hidden_dim=config.model.hidden_dim,
             )
         )
-        run_name = f"{config.experiment_name}_seed{config.seed}"
-        self.run_dir = Path(config.output_dir) / run_name
-        self.checkpoint_dir = Path(config.checkpoint_dir) / run_name
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        with (self.run_dir / "resolved_config.json").open("w", encoding="utf-8") as handle:
-            json.dump(config.to_dict(), handle, indent=2, ensure_ascii=False)
+        if record_run:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            if not config_path.exists():
+                with config_path.open("w", encoding="utf-8") as handle:
+                    json.dump(config.to_dict(), handle, indent=2, ensure_ascii=False)
         metric_fields = [
             "step", "elapsed_seconds", "temperature", "active_prototypes",
             "rollout_return", "rollout_episode_length", "rollout_win_rate",
@@ -101,18 +142,27 @@ class GRDCTrainer:
             "role_entropy", "decorrelation_loss", "approx_kl", "clip_fraction",
             "pruned_prototypes", "eval_return_mean", "eval_return_std",
             "eval_episode_length", "eval_win_rate",
+            "actor_grad_norm", "actor_grad_norm_max", "actor_grad_clip_scale", "policy_head_grad_norm",
+            "rollout_mean_step_reward", "eval_mean_step_reward", "eval_step_reward_std",
         ] + [f"role_{i}_count" for i in range(config.model.n_prototypes)]
-        self.csv = CsvLogger(self.run_dir / "metrics.csv", metric_fields)
-        try:
-            from torch.utils.tensorboard import SummaryWriter
+        self.csv = CsvLogger(self.run_dir / "metrics.csv", metric_fields) if record_run else None
+        self.writer = None
+        if record_run:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
 
-            self.writer = SummaryWriter(self.run_dir / "tensorboard")
-        except ImportError:
-            self.writer = None
+                self.writer = SummaryWriter(self.run_dir / "tensorboard")
+            except ImportError:
+                pass
         self.global_step = 0
         self.update_number = 0
         self.last_prune_step = 0
         self.best_eval_return = -float("inf")
+        self.stop_requested = False
+
+    def request_stop(self) -> None:
+        self.stop_requested = True
+        print("Stop requested: finishing the current rollout/update before saving interrupt.pt.", flush=True)
 
     def _make_actor_optimizer(self) -> torch.optim.Adam:
         return torch.optim.Adam(
@@ -134,6 +184,7 @@ class GRDCTrainer:
         self.buffer.reset(self.config.model.n_prototypes)
         transition = self.env.reset(seed=self.config.seed + self.update_number)
         hidden = self.actor.initial_hidden(1, self.env.n_agents, self.device)
+        previous_actions = np.full(self.env.n_agents, -1, dtype=np.int64)
         episode_start = True
         episode_return = 0.0
         episode_length = 0
@@ -153,6 +204,7 @@ class GRDCTrainer:
             actor_out = self.actor.forward_step(
                 observations, hidden, adjacency, available,
                 temperature=self.temperature(), deterministic=False,
+                previous_actions=self._tensor(previous_actions, torch.long).unsqueeze(0),
             )
             distribution = Categorical(logits=actor_out.logits)
             actions = distribution.sample()
@@ -184,11 +236,13 @@ class GRDCTrainer:
                 reward=next_transition.reward,
                 episode_start=episode_start,
                 episode_end=episode_end,
+                previous_actions=previous_actions,
             )
             self.global_step += 1
             episode_return += next_transition.reward
             episode_length += 1
             hidden = actor_out.hidden
+            previous_actions = actions.squeeze(0).cpu().numpy()
             transition = next_transition
             episode_start = False
             if episode_end:
@@ -198,6 +252,7 @@ class GRDCTrainer:
                     wins.append(float(next_transition.info["battle_won"]))
                 transition = self.env.reset()
                 hidden = self.actor.initial_hidden(1, self.env.n_agents, self.device)
+                previous_actions = np.full(self.env.n_agents, -1, dtype=np.int64)
                 episode_return = 0.0
                 episode_length = 0
                 episode_start = True
@@ -210,6 +265,8 @@ class GRDCTrainer:
             "rollout_episode_length": float(np.mean(completed_lengths)) if completed_lengths else episode_length,
             "rollout_win_rate": float(np.mean(wins)) if wins else float("nan"),
             "completed_episodes": float(len(completed_returns)),
+            "rollout_mean_step_reward": float(np.mean(np.asarray(completed_returns) / np.asarray(completed_lengths)))
+            if completed_returns else episode_return / max(episode_length, 1),
         }
 
     def _tensor(self, array: np.ndarray, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -243,6 +300,7 @@ class GRDCTrainer:
                 available = self._tensor(self.buffer.available_actions[idx])
                 actions = self._tensor(self.buffer.actions[idx], torch.long)
                 forced_roles = self._tensor(self.buffer.role_assignments[idx], torch.long)
+                previous_actions = self._tensor(self.buffer.previous_actions[idx], torch.long)
                 old_log_probabilities = self._tensor(self.buffer.log_probabilities[idx])
                 episode_starts = self._tensor(self.buffer.episode_starts[idx], torch.bool)
                 hidden = self._tensor(self.buffer.hidden[batch_starts])
@@ -258,6 +316,7 @@ class GRDCTrainer:
                         observations[time_index], hidden, adjacency[time_index],
                         available[time_index], temperature=self.temperature(),
                         deterministic=False, forced_roles=forced_roles[time_index],
+                        previous_actions=previous_actions[time_index],
                     )
                     distribution = Categorical(logits=actor_out.logits)
                     new_log_probs.append(distribution.log_prob(actions[time_index]))
@@ -285,24 +344,25 @@ class GRDCTrainer:
                 )
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 actor_loss.backward()
-                nn.utils.clip_grad_norm_(self.actor.parameters(), cfg.max_grad_norm)
+                policy_grad_norm = self.actor.policy[-1].weight.grad.norm().item()
+                grad_norm = float(nn.utils.clip_grad_norm_(
+                    self.actor.parameters(), cfg.max_grad_norm, error_if_nonfinite=True))
+                totals.actor_grad_norm += grad_norm
+                totals.actor_grad_norm_max = max(totals.actor_grad_norm_max, grad_norm)
+                totals.actor_grad_clip_scale += min(1.0, cfg.max_grad_norm / max(grad_norm, 1e-12))
+                totals.policy_head_grad_norm += policy_grad_norm
                 self.actor_optimizer.step()
 
                 states = self._tensor(self.buffer.states[idx]).reshape(-1, self.env.state_dim)
                 returns = self._tensor(self.buffer.returns[idx]).reshape(-1)
                 old_values = self._tensor(self.buffer.values[idx]).reshape(-1)
                 values = self.critic(states)
-                clipped_values = old_values + (values - old_values).clamp(
-                    -cfg.value_clip, cfg.value_clip
-                )
-                value_loss_unclipped = (values - returns).pow(2)
-                value_loss_clipped = (clipped_values - returns).pow(2)
-                value_loss = 0.5 * torch.maximum(
-                    value_loss_unclipped, value_loss_clipped
-                ).mean()
+                td_targets = self._tensor(
+                    self.buffer.rewards[idx] + cfg.gamma * self.buffer.next_values[idx]).reshape(-1)
+                value_loss = critic_loss(values, old_values, returns, td_targets, cfg)
                 self.critic_optimizer.zero_grad(set_to_none=True)
                 (cfg.value_coef * value_loss).backward()
-                nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.max_grad_norm, error_if_nonfinite=True)
                 self.critic_optimizer.step()
 
                 with torch.no_grad():
@@ -319,7 +379,8 @@ class GRDCTrainer:
                 batches += 1
 
         for field_name in totals.__dataclass_fields__:
-            setattr(totals, field_name, getattr(totals, field_name) / max(batches, 1))
+            if field_name != "actor_grad_norm_max":
+                setattr(totals, field_name, getattr(totals, field_name) / max(batches, 1))
         self.update_number += 1
         return totals
 
@@ -352,6 +413,7 @@ class GRDCTrainer:
             for episode in range(episodes or self.config.training.eval_episodes):
                 transition = eval_env.reset(seed=self.config.seed + 100_000 + episode)
                 hidden = self.actor.initial_hidden(1, eval_env.n_agents, self.device)
+                previous_actions = torch.full((1, eval_env.n_agents), -1, device=self.device, dtype=torch.long)
                 episode_return = 0.0
                 length = 0
                 while True:
@@ -360,8 +422,10 @@ class GRDCTrainer:
                         self._tensor(transition.adjacency).unsqueeze(0),
                         self._tensor(transition.available_actions).unsqueeze(0),
                         temperature=self.temperature(), deterministic=True,
+                        previous_actions=previous_actions,
                     )
                     actions = out.logits.argmax(dim=-1).squeeze(0).cpu().numpy()
+                    previous_actions = torch.as_tensor(actions, device=self.device).unsqueeze(0)
                     roles = out.role_assignments.squeeze(0).cpu().numpy()
                     role_counts += np.bincount(
                         roles, minlength=self.config.model.n_prototypes
@@ -383,13 +447,18 @@ class GRDCTrainer:
             "eval_return_std": float(np.std(returns)),
             "eval_episode_length": float(np.mean(lengths)),
             "eval_win_rate": float(np.mean(wins)) if wins else float("nan"),
+            "eval_mean_step_reward": float(np.mean(np.asarray(returns) / np.asarray(lengths))),
+            "eval_step_reward_std": float(np.std(np.asarray(returns) / np.asarray(lengths))),
         }
         for role, count in enumerate(role_counts):
             result[f"role_{role}_count"] = float(count)
         return result
 
     def save_checkpoint(self, name: str) -> Path:
+        if not self.record_run:
+            raise RuntimeError("Evaluation-only trainers cannot write checkpoints")
         path = self.checkpoint_dir / name
+        temporary = path.with_name(path.name + ".tmp")
         torch.save(
             {
                 "config": self.config.to_dict(),
@@ -401,13 +470,23 @@ class GRDCTrainer:
                 "update_number": self.update_number,
                 "last_prune_step": self.last_prune_step,
                 "best_eval_return": self.best_eval_return,
+                "implementation_revision": "attention-safety-v2",
+                "rng_state": {
+                    "python": random.getstate(),
+                    "numpy": np.random.get_state(),
+                    "torch": torch.get_rng_state(),
+                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+                },
             },
-            path,
+            temporary,
         )
+        temporary.replace(path)
         return path
 
     def load_checkpoint(self, path: str | Path, load_optimizers: bool = True) -> None:
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        saved_config = config_from_dict(checkpoint["config"])
+        validate_checkpoint_config(self.config, saved_config, load_optimizers)
         self.actor.load_state_dict(checkpoint["actor"])
         self.critic.load_state_dict(checkpoint["critic"])
         if load_optimizers:
@@ -417,14 +496,24 @@ class GRDCTrainer:
         self.update_number = int(checkpoint.get("update_number", 0))
         self.last_prune_step = int(checkpoint.get("last_prune_step", 0))
         self.best_eval_return = float(checkpoint.get("best_eval_return", -float("inf")))
+        if load_optimizers and "rng_state" in checkpoint:
+            state = checkpoint["rng_state"]
+            random.setstate(state["python"])
+            np.random.set_state(state["numpy"])
+            torch.set_rng_state(state["torch"].cpu())
+            if torch.cuda.is_available() and len(state["cuda"]) == torch.cuda.device_count():
+                torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
 
-    def train(self) -> None:
+    def train(self, stop_after_steps: int | None = None) -> None:
+        if not self.record_run:
+            raise RuntimeError("Evaluation-only trainers cannot train")
         cfg = self.config.training
-        next_eval = max(cfg.eval_interval_steps, 1)
-        next_save = max(cfg.save_interval_steps, 1)
+        next_eval = (self.global_step // cfg.eval_interval_steps + 1) * cfg.eval_interval_steps
+        next_save = (self.global_step // cfg.save_interval_steps + 1) * cfg.save_interval_steps
+        target = min(cfg.total_steps, stop_after_steps) if stop_after_steps is not None else cfg.total_steps
         started = time.time()
         try:
-            while self.global_step < cfg.total_steps:
+            while self.global_step < target:
                 rollout_metrics = self.collect_rollout()
                 train_metrics = self.update()
                 pruned = self.maybe_prune()
@@ -447,7 +536,9 @@ class GRDCTrainer:
                         self.best_eval_return = evaluation["eval_return_mean"]
                         self.save_checkpoint("best.pt")
                 if self.global_step >= next_save:
-                    self.save_checkpoint(f"step_{self.global_step}.pt")
+                    self.save_checkpoint("latest.pt")
+                    if cfg.keep_step_checkpoints:
+                        self.save_checkpoint(f"step_{self.global_step}.pt")
                     next_save += cfg.save_interval_steps
 
                 self.csv.write(row)
@@ -460,7 +551,11 @@ class GRDCTrainer:
                     f"policy={train_metrics.policy_loss:.4f} value={train_metrics.value_loss:.4f} "
                     f"roles={self.actor.n_active_prototypes}"
                 )
+                if self.stop_requested:
+                    self.save_checkpoint("interrupt.pt")
+                    break
             self.save_checkpoint("last.pt")
+            self.save_checkpoint("latest.pt")
         finally:
             self.env.close()
             if self.writer is not None:

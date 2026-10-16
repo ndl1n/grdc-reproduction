@@ -19,7 +19,7 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = config_from_dict(checkpoint["config"])
     config.device = args.device
-    trainer = GRDCTrainer(config)
+    trainer = GRDCTrainer(config, record_run=False)
     try:
         trainer.load_checkpoint(args.checkpoint, load_optimizers=False)
         print(json.dumps(trainer.evaluate(args.episodes), indent=2, ensure_ascii=False))

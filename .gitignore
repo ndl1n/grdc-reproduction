@@ -8,3 +8,26 @@ checkpoints/*
 !checkpoints/.gitkeep
 role_analysis/
 *.egg-info/
+
+# Generated experiment reports, exports, and rendering/test scratch files.
+/results/
+/tmp/
+*.pt
+*.pth
+*.ckpt
+*.pt.tmp
+.ipynb_checkpoints/
+*.log
+
+# Local environments, credentials, and tooling caches.
+venv/
+.env
+.env.*
+!.env.example
+!.env.template
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+Thumbs.db
